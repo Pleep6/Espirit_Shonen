@@ -254,17 +254,24 @@ const ROLE_ORDER=['top','jgl','mid','bot','sup'];
 let DD=''; const CK={}; let currentSide='all';
 let ROLES_MAP = {};
 
-// Load roles: prefer the merged /api/roles endpoint (all series folders combined),
-// fall back to the old root-only roles.json for older app_scouting.py versions.
-fetch('http://localhost:5000/api/roles')
+// Load roles: SIEMPRE probar primero el mismo origen (relativo) — es el
+// único que garantiza que los datos son de ESTE proyecto/servidor. El
+// puerto 5000 hardcodeado queda como último recurso, porque si hay
+// CUALQUIER otro servidor (de otro proyecto) escuchando ahí, sus datos
+// contaminarían esta página aunque no tengan nada que ver.
+fetch('api/roles')
   .then(r => r.ok ? r.json() : Promise.reject())
   .then(d => { ROLES_MAP = d; })
   .catch(() => {
-    fetch('http://localhost:5000/output/roles.json')
-      .catch(() => fetch('roles.json'))
-      .then(r => r.ok ? r.json() : {})
+    fetch('roles.json')
+      .then(r => r.ok ? r.json() : Promise.reject())
       .then(d => { ROLES_MAP = d; })
-      .catch(() => {});
+      .catch(() => {
+        fetch('http://localhost:5000/api/roles')
+          .then(r => r.ok ? r.json() : Promise.reject())
+          .then(d => { ROLES_MAP = d; })
+          .catch(() => {});
+      });
   });
 
 async function loadDD(){
@@ -430,9 +437,11 @@ function compute(games){
 
     ourPickList.forEach(p=>{
       const c=p.championName;if(!c)return;
-      let rk=roleKey(p.role);
       const n_=nick(p.playerName);
-      if(!rk){const fromJson=ROLES_MAP[n_.toLowerCase()];if(fromJson)rk=roleKey(fromJson);}
+      let rk=null;
+      const fromJson=ROLES_MAP[n_.toLowerCase()];
+      if(fromJson) rk=roleKey(fromJson);
+      if(!rk) rk=roleKey(p.role);
       if(!picks[c])picks[c]={count:0,wins:0,players:{},roles:{}};
       picks[c].count++;if(won)picks[c].wins++;
       picks[c].players[n_]=(picks[c].players[n_]||0)+1;
@@ -476,13 +485,16 @@ function compute(games){
     ourPickList.forEach(p=>{
       const c=p.championName;if(!c)return;
       const n_=nick(p.playerName);
-      let rk=roleKey(p.role);
-      if(!rk){const fromJson=ROLES_MAP[n_.toLowerCase()];if(fromJson)rk=roleKey(fromJson);}
-      // Same-role opponent pick, resolved via ROLES_MAP fallback like elsewhere
+      let rk=null;
+      const fromJson_=ROLES_MAP[n_.toLowerCase()];
+      if(fromJson_) rk=roleKey(fromJson_);
+      if(!rk) rk=roleKey(p.role);
       let enemyPick=null;
       for(const ep of enemyPickList){
-        let erk=roleKey(ep.role);
-        if(!erk){const fromJson=ROLES_MAP[nick(ep.playerName).toLowerCase()];if(fromJson)erk=roleKey(fromJson);}
+        let erk=null;
+        const epFromJson=ROLES_MAP[nick(ep.playerName).toLowerCase()];
+        if(epFromJson) erk=roleKey(epFromJson);
+        if(!erk) erk=roleKey(ep.role);
         if(rk && erk===rk){enemyPick=ep;break;}
       }
       let blind=null; // null = unknown (missing turn/role data)
@@ -841,12 +853,25 @@ function buildMatchCard(g, OUR){
   }).join('');
 
   function pickRole(p){
-    let rk=roleKey(p.role);
-    if(!rk){ const fromJson=ROLES_MAP[nick(p.playerName).toLowerCase()]; if(fromJson) rk=roleKey(fromJson); }
-    return rk;
+    const fromJson=ROLES_MAP[nick(p.playerName).toLowerCase()];
+    if(fromJson) return roleKey(fromJson);
+    return roleKey(p.role);
   }
-  const ourPicks=(g.picks?.[OUR]||[]).map(p=>({...p, rk:pickRole(p)}));
-  const enemyPicks=(g.picks?.[enemyId]||[]).map(p=>({...p, rk:pickRole(p)}));
+  // Si de los 5 picks de un equipo se conocen 4 posiciones distintas, la 5ª
+  // (el único pick sin rol resuelto) solo puede ser la que falta — no puede
+  // haber dos jugadores en el mismo rol en el mismo equipo.
+  function deduceMissingRole(picks){
+    const withRole = picks.filter(p=>p.rk);
+    const withoutRole = picks.filter(p=>!p.rk);
+    if(withoutRole.length===1 && withRole.length===4){
+      const known = new Set(withRole.map(p=>p.rk));
+      const missing = ROLE_ORDER.filter(rk=>!known.has(rk));
+      if(missing.length===1) withoutRole[0].rk = missing[0];
+    }
+    return picks;
+  }
+  const ourPicks=deduceMissingRole((g.picks?.[OUR]||[]).map(p=>({...p, rk:pickRole(p)})));
+  const enemyPicks=deduceMissingRole((g.picks?.[enemyId]||[]).map(p=>({...p, rk:pickRole(p)})));
 
   const rows=ROLE_ORDER.map(rk=>{
     const our=ourPicks.find(p=>p.rk===rk);
@@ -1046,24 +1071,37 @@ document.querySelectorAll('.nav-tab').forEach(t=>{
 (async()=>{
   await loadDD();
 
-  try {
-    // 1. Try Flask
-    const r = await fetch('http://localhost:5000/api/all_picks_bans');
-    if (r.ok) {
-      const apiData = await r.json();
-      if (apiData.games && apiData.games.length > 0) {
-        apiData.games = deduplicateGames(apiData.games);
-        window.DATA = apiData;
-        const seriesCount = new Set(apiData.games.map(g=>
-          Object.values(g.team_names||{}).sort().join('|')
-        )).size;
-        document.getElementById('seasonInfo').textContent =
-          `${apiData.games.length} games · ${seriesCount} series`;
-        renderAll();
-        return;
-      }
-    }
-  } catch(e) { console.warn('Flask API unavailable:', e); }
+  async function tryFetchGames(url){
+    const r = await fetch(url);
+    if(!r.ok) return null;
+    const apiData = await r.json();
+    if(!apiData.games || !apiData.games.length) return null;
+    return apiData;
+  }
+
+  let apiData = null;
+
+  // 1. Mismo origen primero (relativo) — garantizado ser de ESTE proyecto.
+  try { apiData = await tryFetchGames('api/all_picks_bans'); }
+  catch(e) { console.warn('Same-origin API unavailable:', e); }
+
+  // 2. Puerto 5000 hardcodeado como último recurso (setups antiguos).
+  if(!apiData){
+    try { apiData = await tryFetchGames('http://localhost:5000/api/all_picks_bans'); }
+    catch(e) { console.warn('Flask :5000 unavailable:', e); }
+  }
+
+  if(apiData){
+    apiData.games = deduplicateGames(apiData.games);
+    window.DATA = apiData;
+    const seriesCount = new Set(apiData.games.map(g=>
+      Object.values(g.team_names||{}).sort().join('|')
+    )).size;
+    document.getElementById('seasonInfo').textContent =
+      `${apiData.games.length} games · ${seriesCount} series`;
+    renderAll();
+    return;
+  }
 
   // 2. Fallback: static JSON (GitHub Pages)
   if (!window.DATA) {
